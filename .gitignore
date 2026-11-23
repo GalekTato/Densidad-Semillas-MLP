@@ -1,0 +1,35 @@
+# Entornos virtuales y cachés de Python
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Documentación LaTeX, enunciado oficial y entregables PDF/ZIP
+docs/
+*.pdf
+*.zip
+*.rar
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Artefactos generados al ejecutar el pipeline (se crean automáticamente)
+data/processed/
+models/
+results/
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
