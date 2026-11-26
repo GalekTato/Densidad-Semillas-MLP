@@ -179,9 +179,9 @@ print("Primeras 5 predicciones:", predicciones[:5])
 
 - **Materia:** Minería de Datos — Benemérita Universidad Autónoma de Puebla (BUAP), Facultad de Ciencias de la Computación (FCC)
 - **Profesor:** Iván Olmos Pineda
-<!-- TODO: Agregar o actualizar integrantes restantes antes de publicar si aplica -->
 - **Estudiantes:**
   - Mestizo Piedra, Jimmy Joey (`202347961`)
+  - Organis Pérez, Eduardo (`202088080`)
   - Razo Montañez, Gael Askary (`202352659`)
 
 ---
