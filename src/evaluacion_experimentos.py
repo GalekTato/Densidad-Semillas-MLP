@@ -59,7 +59,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold, learning_curve
-from sklearn.neighbors import NearestCentroid
+from sklearn.neighbors import NearestCentroid, NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, label_binarize
 
@@ -1304,6 +1304,456 @@ def run_bootstrap_test(
     return df_boot
 
 
+PRIMARY_COLUMNS: list[str] = [
+    "Area",
+    "Perimeter",
+    "MajorAxisLength",
+    "MinorAxisLength",
+    "ConvexArea",
+    "Extent",
+]
+
+
+def _recompute_derived_features(df_prim: pd.DataFrame) -> pd.DataFrame:
+    """Reconstruye las 16 variables preservando identidades geométricas exactas."""
+    A = np.maximum(df_prim["Area"].to_numpy(dtype=float), 1000.0)
+    L = np.maximum(df_prim["MajorAxisLength"].to_numpy(dtype=float), 20.0)
+    l = np.clip(df_prim["MinorAxisLength"].to_numpy(dtype=float), 10.0, L * 0.9999)
+    CA = np.maximum(df_prim["ConvexArea"].to_numpy(dtype=float), A * 1.0001)
+    # Desigualdad isoperimétrica (4*pi*A / P^2 < 1) para garantizar roundness física válida
+    P = np.maximum(df_prim["Perimeter"].to_numpy(dtype=float), np.sqrt(4.0 * np.pi * A) * 1.0005)
+    Ex = np.clip(df_prim["Extent"].to_numpy(dtype=float), 0.45, 0.92)
+
+    ar = L / l
+    ecc = np.sqrt(np.maximum(0.0, 1.0 - (l / L) ** 2))
+    ed = np.sqrt(4.0 * A / np.pi)
+    sol = A / CA
+    rnd = (4.0 * np.pi * A) / (P ** 2)
+    cmp_v = ed / L
+    sf1 = L / A
+    sf2 = A / (L ** 3)
+    sf3 = cmp_v ** 2
+    sf4 = (4.0 * A) / (np.pi * L * l)
+
+    out = pd.DataFrame(
+        {
+            "Area": A,
+            "Perimeter": P,
+            "MajorAxisLength": L,
+            "MinorAxisLength": l,
+            "AspectRation": ar,
+            "Eccentricity": ecc,
+            "ConvexArea": CA,
+            "EquivDiameter": ed,
+            "Extent": Ex,
+            "Solidity": sol,
+            "roundness": rnd,
+            "Compactness": cmp_v,
+            "ShapeFactor1": sf1,
+            "ShapeFactor2": sf2,
+            "ShapeFactor3": sf3,
+            "ShapeFactor4": sf4,
+        }
+    )
+    return out[FEATURE_COLUMNS]
+
+
+def _predict_with_entropy(
+    pipe: Pipeline, X: np.ndarray
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Ejecuta inferencia sin ajuste y calcula entropía normalizada si hay probabilidades."""
+    preds = pipe.predict(X)
+    if not hasattr(pipe.named_steps["clf"], "predict_proba"):
+        return preds, None, None, None
+    probs = pipe.predict_proba(X)
+    h_norm = -np.sum(probs * np.log(np.clip(probs, 1e-15, 1.0)), axis=1) / np.log(4.0)
+    max_p = np.max(probs, axis=1)
+    return preds, probs, h_norm, max_p
+
+
+def _compute_dbscan_manifold_coverage(
+    X_syn: np.ndarray,
+    y_syn: np.ndarray,
+    nn_c3: NearestNeighbors,
+    nn_main: NearestNeighbors,
+    scaler1: Any,
+    scaler2: Any,
+    pca2: Any,
+) -> float:
+    """Porcentaje de muestras sintéticas dentro del radio epsilon de su estrato DBSCAN."""
+    in_manifold = np.zeros(len(X_syn), dtype=bool)
+    m3 = y_syn == 3
+    if np.any(m3):
+        d3, _ = nn_c3.kneighbors(scaler1.transform(X_syn[m3]), n_neighbors=1)
+        in_manifold[m3] = d3[:, 0] <= 1.50
+    m012 = ~m3
+    if np.any(m012):
+        xp2 = pca2.transform(scaler2.transform(X_syn[m012]))
+        d2, _ = nn_main.kneighbors(xp2, n_neighbors=1)
+        in_manifold[m012] = d2[:, 0] <= 0.38
+    return float(100.0 * np.mean(in_manifold))
+
+
+def _row_keys_array(df_feats: pd.DataFrame) -> list[tuple[float, ...]]:
+    """Llave numérica canónica por fila (9 decimales) para cruce exacto con el crudo."""
+    arr = np.round(df_feats[FEATURE_COLUMNS].to_numpy(dtype=float), 9)
+    return [tuple(row) for row in arr.tolist()]
+
+
+def _generate_synthetic_cohorts(
+    test_df: pd.DataFrame, raw_key_set: set[tuple[float, ...]]
+) -> list[tuple[str, float | None, np.ndarray, np.ndarray]]:
+    """Genera cohorte interpolada intra-clase (n=2,000) y perturbaciones gaussianas."""
+    rng_interp = np.random.default_rng(RANDOM_STATE)
+    n_per_class = 500
+    interp_frames: list[pd.DataFrame] = []
+    interp_labels: list[np.ndarray] = []
+
+    for c in range(4):
+        sub_c = test_df[test_df["cluster"] == c].reset_index(drop=True)
+        X_c_scaled = StandardScaler().fit_transform(sub_c[PRIMARY_COLUMNS].to_numpy(dtype=float))
+        k_nn = min(6, len(sub_c))
+        _, nn_idx = NearestNeighbors(n_neighbors=k_nn).fit(X_c_scaled).kneighbors(X_c_scaled)
+        neighbor_pool = nn_idx[:, 1:]
+
+        base_i = rng_interp.integers(0, len(sub_c), size=n_per_class)
+        nbr_j = rng_interp.integers(0, neighbor_pool.shape[1], size=n_per_class)
+        lam = rng_interp.uniform(0.15, 0.85, size=(n_per_class, 1))
+
+        prim_arr = sub_c[PRIMARY_COLUMNS].to_numpy(dtype=float)
+        syn_prim = (1.0 - lam) * prim_arr[base_i] + lam * prim_arr[neighbor_pool[base_i, nbr_j]]
+        interp_frames.append(pd.DataFrame(syn_prim, columns=PRIMARY_COLUMNS))
+        interp_labels.append(np.full(n_per_class, c, dtype=np.int64))
+
+    df_interp = _recompute_derived_features(pd.concat(interp_frames, ignore_index=True))
+    y_interp = np.concatenate(interp_labels)
+
+    # Garantía de cero colisiones con datos reales e invariantes físicos estrictos
+    assert (df_interp["Area"] <= df_interp["ConvexArea"]).all()
+    assert (df_interp["Solidity"] <= 1.0).all()
+    assert (df_interp["roundness"] <= 1.0).all()
+    interp_keys = set(_row_keys_array(df_interp))
+    assert len(interp_keys & raw_key_set) == 0, "Colisión inesperada entre sintéticos y reales."
+
+    cohorts: list[tuple[str, float | None, np.ndarray, np.ndarray]] = [
+        (
+            "Interpolación geométrica intra-clase (n=2,000)",
+            np.nan,
+            df_interp[FEATURE_COLUMNS].to_numpy(dtype=float),
+            y_interp,
+        )
+    ]
+
+    # Perturbación gaussiana controlada por desviación estándar intra-clase de test
+    X_test_orig = test_df[FEATURE_COLUMNS].to_numpy(dtype=float)
+    y_test = test_df["cluster"].to_numpy(dtype=np.int64)
+    prim_test = test_df[PRIMARY_COLUMNS].to_numpy(dtype=float)
+    std_by_class = {
+        c: np.std(prim_test[y_test == c], axis=0, ddof=1) for c in range(4)
+    }
+
+    for sigma in [0.00, 0.01, 0.02, 0.05, 0.10, 0.15]:
+        if sigma == 0.0:
+            X_noisy = X_test_orig
+        else:
+            rng_g = np.random.default_rng(RANDOM_STATE + int(round(sigma * 1000)))
+            noisy_prim = prim_test.copy()
+            for c in range(4):
+                mc = y_test == c
+                noise = rng_g.normal(0.0, sigma * std_by_class[c], size=(int(mc.sum()), len(PRIMARY_COLUMNS)))
+                noisy_prim[mc] = prim_test[mc] + noise
+            df_noisy = _recompute_derived_features(pd.DataFrame(noisy_prim, columns=PRIMARY_COLUMNS))
+            X_noisy = df_noisy[FEATURE_COLUMNS].to_numpy(dtype=float)
+        cohorts.append((f"Perturbación gaussiana (sigma={sigma:.2f})", float(sigma), X_noisy, y_test))
+
+    return cohorts
+
+
+def _plot_synthetic_and_raw_figure(
+    df_syn: pd.DataFrame, df_raw_eval: pd.DataFrame, out_path: Path
+) -> None:
+    """Genera figura doble: generalización sintética y evaluación sobre el dataset crudo."""
+    fig, axes = plt.subplots(1, 2, figsize=(15.5, 5.8))
+
+    # Panel izquierdo: F1-Macro en interpolación + perturbación gaussiana sigma 0..15%
+    ax = axes[0]
+    regimes = [
+        "Interpolación geométrica intra-clase (n=2,000)",
+        "Perturbación gaussiana (sigma=0.00)",
+        "Perturbación gaussiana (sigma=0.01)",
+        "Perturbación gaussiana (sigma=0.02)",
+        "Perturbación gaussiana (sigma=0.05)",
+        "Perturbación gaussiana (sigma=0.10)",
+        "Perturbación gaussiana (sigma=0.15)",
+    ]
+    x_labels = ["Interp.\n(n=2,000)", "σ=0%", "σ=1%", "σ=2%", "σ=5%", "σ=10%", "σ=15%"]
+    x = np.arange(len(regimes))
+
+    model_styles = [
+        ("MLP Ganador 1-SE", "#2563eb", "o-", 2.2),
+        ("MLP Top-1 Absoluto", "#9333ea", "^--", 1.8),
+        ("Base: Regresión Logística", "#059669", "s-.", 1.9),
+        ("Base: Centroide Más Cercano", "#f59e0b", "D:", 1.8),
+    ]
+    for m_name, col, fmt, lw in model_styles:
+        sub = df_syn[df_syn["modelo"] == m_name].set_index("regimen").reindex(regimes)
+        ax.plot(x, sub["f1_macro"].to_numpy(dtype=float), fmt, color=col, lw=lw, label=m_name)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, fontsize=8.8)
+    ax.set_ylim(0.75, 1.02)
+    ax.set_ylabel("F1-Macro (fidelidad sintética)")
+    ax.set_title("Generalización con Datos Sintéticos Coherentes y Estrés Gaussiano", fontsize=11.0, fontweight="bold")
+    ax.grid(True, alpha=0.35)
+
+    ax2 = ax.twinx()
+    sub_1se = df_syn[df_syn["modelo"] == "MLP Ganador 1-SE"].set_index("regimen").reindex(regimes)
+    l_ent, = ax2.plot(
+        x,
+        sub_1se["entropia_media"].to_numpy(dtype=float),
+        "X--",
+        color="#dc2626",
+        lw=1.7,
+        alpha=0.85,
+        label="Entropía media H_norm (MLP 1-SE)",
+    )
+    ax2.set_ylabel("Entropía normalizada media (MLP 1-SE)", color="#dc2626")
+    ax2.tick_params(axis="y", colors="#dc2626")
+    ax2.set_ylim(0.0, 0.35)
+
+    h1, l1 = ax.get_legend_handles_labels()
+    ax.legend(
+        h1 + [l_ent],
+        l1 + [l_ent.get_label()],
+        loc="center left",
+        bbox_to_anchor=(0.02, 0.45),
+        fontsize=7.8,
+        frameon=True,
+    )
+
+    # Panel derecho: Inferencia del MLP Ganador 1-SE sobre Dataset.csv crudo (13,611 filas)
+    ax = axes[1]
+    sub_r = df_raw_eval[df_raw_eval["modelo"] == "MLP Ganador 1-SE"].copy()
+    sub_order = [
+        ("Crudo con Estrato Válido (únicos + dup.)", "Crudo\nVálido"),
+        ("Crudo Válido No en Train (Val+Test+dup.)", "Crudo\nNo Train"),
+        ("Crudo: Duplicados Válidos (n exactos)", "Duplicados\nVálidos"),
+        ("Crudo Total (Dataset.csv 13,611)", "Crudo\nTotal"),
+        ("Crudo Ruido E1: Global 16D", "Ruido E1\nGlobal"),
+        ("Crudo Ruido E2: Puente/Frontera", "Ruido E2\nPuente"),
+        ("Crudo Ruido E2: Periferia/Baja Dens.", "Ruido E2\nPerif."),
+    ]
+    sub_r = sub_r.set_index("subconjunto_crudo").reindex([k for k, _ in sub_order])
+    xr = np.arange(len(sub_order))
+    w = 0.36
+
+    acc_pct = sub_r["accuracy"].fillna(0.0).to_numpy(dtype=float) * 100.0
+    unc_pct = sub_r["pct_alta_incertidumbre_h_gt_03"].to_numpy(dtype=float)
+    n_vals = sub_r["n_registros"].to_numpy(dtype=int)
+
+    b1 = ax.bar(xr[:3] - w / 2, acc_pct[:3], width=w, color="#2563eb", label="Concordancia c/ DBSCAN (%)")
+    b2 = ax.bar(xr + w / 2, unc_pct, width=w, color="#f59e0b", label="% Alta incertidumbre (H > 0.30)")
+    for bar, v in zip(b1, acc_pct[:3]):
+        ax.text(bar.get_x() + bar.get_width() / 2, v + 1.5, f"{v:.2f}%", ha="center", va="bottom", fontsize=7.4, fontweight="bold")
+    for bar, v in zip(b2, unc_pct):
+        ax.text(bar.get_x() + bar.get_width() / 2, v + 1.5, f"{v:.1f}%", ha="center", va="bottom", fontsize=7.6)
+
+    ax.set_xticks(xr)
+    ax.set_xticklabels([f"{lbl}\n(n={n:,})" for (_, lbl), n in zip(sub_order, n_vals)], fontsize=8.0)
+    ax.set_ylim(0, 114)
+    ax.set_ylabel("Porcentaje (%)")
+    ax.set_title("Inferencia Directa sobre Dataset Crudo (Dataset.csv, 13,611 filas)", fontsize=11.0, fontweight="bold")
+    ax.legend(loc="upper right", fontsize=8.2, frameon=True)
+    ax.grid(axis="y", alpha=0.35)
+
+    fig.suptitle(
+        "Validación Externa sin Reentrenamiento: Datos Sintéticos Geométricos y Dataset Crudo",
+        fontsize=13.2,
+        fontweight="bold",
+        y=1.01,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def evaluate_synthetic_and_raw_dataset(
+    base_dir: Path = PROJECT_ROOT,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evalúa modelos congelados sobre datos sintéticos y sobre Dataset.csv crudo."""
+    models_dir = base_dir / "models"
+    data_dir = base_dir / "data" / "processed"
+    raw_csv = base_dir / "data" / "raw" / "Dataset.csv"
+    table_dir = base_dir / "results" / "tablas"
+    fig_dir = base_dir / "results" / "figuras"
+    table_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    # Carga exclusivamente en modo lectura de los modelos ya entrenados y congelados
+    frozen_models: list[tuple[str, Pipeline]] = [
+        ("MLP Ganador 1-SE", joblib.load(models_dir / "mejor_modelo_mlp_final.joblib")),
+        ("MLP Top-1 Absoluto", joblib.load(models_dir / "mejor_modelo_mlp_top1.joblib")),
+        ("Base: Regresión Logística", joblib.load(models_dir / "baseline_logreg.joblib")),
+        ("Base: Centroide Más Cercano", joblib.load(models_dir / "baseline_nearest_centroid.joblib")),
+    ]
+    scaler1 = joblib.load(models_dir / "scaler_etapa1_dbscan.joblib")
+    scaler2 = joblib.load(models_dir / "scaler_etapa2_dbscan.joblib")
+    pca2 = joblib.load(models_dir / "pca_etapa2_dbscan.joblib")
+
+    clean_df = pd.read_csv(data_dir / "dataset_limpio_clusters.csv")
+    noise_df = pd.read_csv(data_dir / "ruido_descartado.csv")
+    train_df = pd.read_csv(data_dir / "train.csv")
+    test_df = pd.read_csv(data_dir / "test.csv")
+
+    # Referencia espacial DBSCAN para medir permanencia dentro del manifold de densidad
+    X_c3_clean = clean_df.loc[clean_df["cluster"] == 3, FEATURE_COLUMNS].to_numpy(dtype=float)
+    X_m_clean = clean_df.loc[clean_df["cluster"] != 3, FEATURE_COLUMNS].to_numpy(dtype=float)
+    nn_c3 = NearestNeighbors(n_neighbors=1).fit(scaler1.transform(X_c3_clean))
+    nn_main = NearestNeighbors(n_neighbors=1).fit(pca2.transform(scaler2.transform(X_m_clean)))
+
+    # Dataset crudo completo (13,611 x 17 -> elimina solo columna vacía final)
+    df_raw_full = pd.read_csv(raw_csv, encoding="utf-8-sig")
+    all_nan_cols = [c for c in df_raw_full.columns if df_raw_full[c].isna().all()]
+    df_raw = df_raw_full.drop(columns=all_nan_cols).copy()
+    raw_keys = _row_keys_array(df_raw)
+    raw_key_set = set(raw_keys)
+
+    # Experimento A: Cohortes sintéticas geométricas y perturbaciones gaussianas
+    cohorts = _generate_synthetic_cohorts(test_df, raw_key_set)
+    syn_rows: list[dict[str, Any]] = []
+    for regimen, sigma_val, X_syn, y_syn in cohorts:
+        manifold_pct = _compute_dbscan_manifold_coverage(
+            X_syn, y_syn, nn_c3, nn_main, scaler1, scaler2, pca2
+        )
+        for m_name, pipe in frozen_models:
+            preds, probs, h_norm, max_p = _predict_with_entropy(pipe, X_syn)
+            roc = (
+                float(roc_auc_score(y_syn, probs, multi_class="ovr"))
+                if probs is not None
+                else np.nan
+            )
+            syn_rows.append(
+                {
+                    "regimen": regimen,
+                    "nivel_ruido_sigma": sigma_val,
+                    "modelo": m_name,
+                    "n_muestras": int(len(y_syn)),
+                    "pct_dentro_manifold_dbscan": manifold_pct,
+                    "accuracy": float(accuracy_score(y_syn, preds)),
+                    "balanced_accuracy": float(balanced_accuracy_score(y_syn, preds)),
+                    "f1_macro": float(f1_score(y_syn, preds, average="macro")),
+                    "roc_auc_ovr": roc,
+                    "entropia_media": float(np.mean(h_norm)) if h_norm is not None else np.nan,
+                    "prob_max_media": float(np.mean(max_p)) if max_p is not None else np.nan,
+                    "pct_alta_incertidumbre_h_gt_03": (
+                        float(100.0 * np.mean(h_norm > 0.30)) if h_norm is not None else np.nan
+                    ),
+                }
+            )
+    df_syn = pd.DataFrame(syn_rows)
+    df_syn.to_csv(table_dir / "evaluacion_datos_sinteticos.csv", index=False)
+
+    # Experimento B: Inferencia directa sobre Dataset.csv crudo completo (13,611 filas)
+    clean_map = dict(zip(_row_keys_array(clean_df), clean_df["cluster"].to_numpy(dtype=np.int64)))
+    noise_origin_map: dict[tuple[float, ...], str] = {}
+    for k, orig, subc in zip(
+        _row_keys_array(noise_df),
+        noise_df["origen_ruido"],
+        noise_df["subcategoria_ruido"],
+    ):
+        if orig == "etapa1_global":
+            noise_origin_map[k] = "ruido_e1"
+        elif "Puente/frontera" in str(subc):
+            noise_origin_map[k] = "ruido_e2_puente"
+        else:
+            noise_origin_map[k] = "ruido_e2_periferia"
+    train_key_set = set(_row_keys_array(train_df))
+
+    dest_cluster = np.array([clean_map.get(k, -1) for k in raw_keys], dtype=np.int64)
+    dest_kind = np.array(
+        [
+            "estrato_valido" if clean_map.get(k, -1) != -1 else noise_origin_map[k]
+            for k in raw_keys
+        ],
+        dtype=object,
+    )
+    in_train = np.array([k in train_key_set for k in raw_keys], dtype=bool)
+    is_dup = df_raw[FEATURE_COLUMNS].duplicated(keep="first").to_numpy(dtype=bool)
+
+    m_valid = dest_cluster != -1
+    raw_subsets: list[tuple[str, np.ndarray]] = [
+        ("Crudo Total (Dataset.csv 13,611)", np.ones(len(df_raw), dtype=bool)),
+        ("Crudo con Estrato Válido (únicos + dup.)", m_valid),
+        ("Crudo Válido No en Train (Val+Test+dup.)", m_valid & (~in_train)),
+        ("Crudo: Duplicados Válidos (n exactos)", m_valid & is_dup),
+        ("Crudo Ruido E1: Global 16D", dest_kind == "ruido_e1"),
+        ("Crudo Ruido E2: Puente/Frontera", dest_kind == "ruido_e2_puente"),
+        ("Crudo Ruido E2: Periferia/Baja Dens.", dest_kind == "ruido_e2_periferia"),
+    ]
+
+    X_raw_all = df_raw[FEATURE_COLUMNS].to_numpy(dtype=float)
+    raw_eval_models = [frozen_models[0], frozen_models[2]]  # MLP 1-SE + Regresión Logística
+    raw_rows: list[dict[str, Any]] = []
+    for m_name, pipe in raw_eval_models:
+        preds_all, probs_all, h_all, maxp_all = _predict_with_entropy(pipe, X_raw_all)
+        assert probs_all is not None and h_all is not None and maxp_all is not None
+        for s_name, mask in raw_subsets:
+            n_sub = int(mask.sum())
+            sub_valid = mask & m_valid
+            n_val_sub = int(sub_valid.sum())
+            p_sub = preds_all[mask]
+            h_sub = h_all[mask]
+            mp_sub = maxp_all[mask]
+
+            if n_val_sub > 0 and s_name != "Crudo Total (Dataset.csv 13,611)":
+                y_sv = dest_cluster[sub_valid]
+                p_sv = preds_all[sub_valid]
+                pr_sv = probs_all[sub_valid]
+                n_hits = int(np.sum(y_sv == p_sv))
+                n_err = int(n_val_sub - n_hits)
+                acc_v = float(accuracy_score(y_sv, p_sv))
+                f1_v = float(f1_score(y_sv, p_sv, average="macro"))
+                roc_v = (
+                    float(roc_auc_score(y_sv, pr_sv, multi_class="ovr"))
+                    if len(np.unique(y_sv)) == 4
+                    else np.nan
+                )
+            else:
+                n_hits = int(np.sum(dest_cluster[sub_valid] == preds_all[sub_valid])) if n_val_sub > 0 else 0
+                n_err = int(n_val_sub - n_hits) if n_val_sub > 0 else 0
+                acc_v = np.nan
+                f1_v = np.nan
+                roc_v = np.nan
+
+            raw_rows.append(
+                {
+                    "modelo": m_name,
+                    "subconjunto_crudo": s_name,
+                    "n_registros": n_sub,
+                    "n_con_estrato_valido": n_val_sub,
+                    "n_aciertos_estrato": n_hits if n_val_sub > 0 else np.nan,
+                    "n_errores_estrato": n_err if n_val_sub > 0 else np.nan,
+                    "accuracy": acc_v,
+                    "f1_macro": f1_v,
+                    "roc_auc_ovr": roc_v,
+                    "entropia_media": float(np.mean(h_sub)),
+                    "prob_max_media": float(np.mean(mp_sub)),
+                    "pct_alta_incertidumbre_h_gt_03": float(100.0 * np.mean(h_sub > 0.30)),
+                    "pct_pred_c0": float(100.0 * np.mean(p_sub == 0)),
+                    "pct_pred_c1": float(100.0 * np.mean(p_sub == 1)),
+                    "pct_pred_c2": float(100.0 * np.mean(p_sub == 2)),
+                    "pct_pred_c3": float(100.0 * np.mean(p_sub == 3)),
+                }
+            )
+    df_raw_eval = pd.DataFrame(raw_rows)
+    df_raw_eval.to_csv(table_dir / "evaluacion_dataset_crudo.csv", index=False)
+
+    _plot_synthetic_and_raw_figure(
+        df_syn, df_raw_eval, fig_dir / "evaluacion_sinteticos_y_crudo.png"
+    )
+    return df_syn, df_raw_eval
+
+
 def run_all_evaluations(base_dir: Path = PROJECT_ROOT) -> None:
     """Orquesta toda la Fase 4 de evaluación y variación estadística."""
     data_dir = base_dir / "data" / "processed"
@@ -1359,6 +1809,8 @@ def run_all_evaluations(base_dir: Path = PROJECT_ROOT) -> None:
         base_dir, X_test, y_test, str(decision["variante_elegida"]), table_dir, fig_dir, n_boot=1000
     )
 
+    df_syn, df_raw_eval = evaluate_synthetic_and_raw_dataset(base_dir)
+
     print("=" * 72)
     print("FASE 4 — EVALUACIÓN, OVERFITTING Y VARIACIÓN ESTADÍSTICA COMPLETADA")
     print("=" * 72)
@@ -1375,6 +1827,10 @@ def run_all_evaluations(base_dir: Path = PROJECT_ROOT) -> None:
     print(df_nb[["modelo_comparado", "diff_media_f1_macro", "t_nadeau_bengio", "p_valor_bilateral", "significativo_005"]].to_string(index=False))
     print("\n[Bootstrap Test B=1,000 (F1-Macro y Accuracy)]")
     print(df_boot[df_boot["metrica"].isin(["accuracy", "f1_macro", "roc_auc_ovr"])].to_string(index=False))
+    print("\n[Datos Sintéticos (Interpolación + Perturbación Gaussiana)]")
+    print(df_syn[df_syn["modelo"] == "MLP Ganador 1-SE"][["regimen", "n_muestras", "pct_dentro_manifold_dbscan", "f1_macro", "accuracy", "entropia_media"]].to_string(index=False))
+    print("\n[Dataset Crudo Completo (Dataset.csv, 13,611 filas)]")
+    print(df_raw_eval[df_raw_eval["modelo"] == "MLP Ganador 1-SE"][["subconjunto_crudo", "n_registros", "n_errores_estrato", "f1_macro", "accuracy", "entropia_media", "pct_alta_incertidumbre_h_gt_03"]].to_string(index=False))
 
 
 def parse_args() -> argparse.Namespace:

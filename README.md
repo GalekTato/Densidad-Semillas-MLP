@@ -53,7 +53,7 @@ flowchart LR
 
 ## Estructura del Repositorio
 
-Los directorios `data/processed/`, `models/` y `results/` no se versionan en Git: se crean automáticamente en la raíz al ejecutar los scripts.
+Los artefactos temporales (`train.csv`, `validation.csv`, `test.csv`, brazos de ablación, `models/` y `results/`) no se versionan en Git: se recrean localmente al ejecutar los scripts. En `data/` se incluyen ambos datasets clave (el **crudo** original y el **limpio** ya depurado y etiquetado por DBSCAN):
 
 ```text
 .
@@ -62,21 +62,23 @@ Los directorios `data/processed/`, `models/` y `results/` no se versionan en Git
 ├── README.md
 ├── requirements.txt
 ├── data/
-│   └── raw/
-│       ├── Dataset.csv          # Dataset morfológico original (13,611 registros)
-│       └── Dataset.txt          # Descripción de las 16 variables
+│   ├── raw/
+│   │   ├── Dataset.csv                    # Dataset morfológico crudo (13,611 x 17)
+│   │   └── Dataset.txt                    # Descripción de las 16 variables
+│   └── processed/
+│       └── dataset_limpio_clusters.csv    # Dataset limpio y etiquetado (11,776 x 17, 4 clases)
 └── src/
-    ├── preprocesameinto.py      # Fase 1: limpieza, EDA y DBSCAN en dos etapas
-    ├── muestreo.py              # Fase 2: muestreo estratificado 70/15/15 y CV
-    ├── entrenamiento.py         # Fase 3: modelos base, GridSearchCV y regla 1-SE
-    └── evaluacion_experimentos.py # Fase 4: test único, OOD y variación estadística
+    ├── preprocesameinto.py                # Fase 1: limpieza, EDA y DBSCAN en dos etapas
+    ├── muestreo.py                        # Fase 2: muestreo estratificado 70/15/15 y CV
+    ├── entrenamiento.py                   # Fase 3: modelos base, GridSearchCV y regla 1-SE
+    └── evaluacion_experimentos.py         # Fase 4: test único, OOD, sintéticos/crudo y RSKF
 ```
 
 ---
 
 ## Nota sobre Inclusión del Dataset
 
-Este repositorio incluye intencionalmente `data/raw/Dataset.csv` (`2.3 MiB`) y `data/raw/Dataset.txt` para que cualquier persona pueda clonar el proyecto y reproducir de extremo a extremo todas las tablas, modelos y figuras en su equipo (Windows o Linux) con un entorno Python limpio, sin descargas externas ni riesgo de desajustes en formato o rutas.
+Este repositorio incluye intencionalmente tanto el dataset crudo (`data/raw/Dataset.csv`, `2.3 MiB`) como el dataset limpio y etiquetado (`data/processed/dataset_limpio_clusters.csv`, `2.1 MiB`) junto con `data/raw/Dataset.txt` para que cualquier persona pueda clonar el proyecto, inspeccionar directamente ambas versiones o reproducir de extremo a extremo todas las tablas, modelos y figuras en Windows o Linux sin descargas externas ni riesgo de desajustes.
 
 ---
 
@@ -169,6 +171,8 @@ print("Primeras 5 predicciones:", predicciones[:5])
 | **Ganador 1-SE (`entrenamiento.py`)** | `MLP(64, 32)`, `tanh`, `Adam`, $\alpha=0.01$, $\text{lr}=0.001$, `batch=128` (`3,300` parámetros, 27 épocas, $\mu_{\text{CV}} = 0.999638$), variante **`sin_balanceo`**. |
 | **Fidelidad en `test.csv` (`n=1,767`)** | **MLP Ganador 1-SE:** `F1-Macro = 1.00000`, `Acc = 1.00000`, `AUC OvR = 1.00000` (vs. Top-1 SGD `0.99863`, Regresión Logística `1.00000`, Centroide `0.96513`). |
 | **Prueba OOD (`ruido_descartado.csv`)** | Entropía de Shannon normalizada: `0.0232` en `test.csv` vs. **`0.3505`** en los `439` puntos puente/frontera (`60.82 %` con $H_{\text{norm}} > 0.30$). |
+| **Prueba con datos sintéticos** | Cohorte geométrica interpolada (`n=2,000`, `0` colisiones reales): **`F1-Macro = 1.00000`**; bajo estrés gaussiano $\sigma = 5\,\%$ / $10\,\%$: `0.98717` / `0.93105` (superando a Top-1 y LogReg). |
+| **Inferencia en dataset crudo (`13,611`)** | `11,827 / 11,828` en estratos válidos (`F1-Macro = 0.99993`, `3,542 / 3,542` no vistos en `train`, `52 / 52` duplicados válidos) y `60.81 %` con $H_{\text{norm}} > 0.30$ en `444` puntos puente crudos. |
 | **Variación estadística** | 20 semillas (Val): `0.999532 ± 0.000880`; RSKF `5×10` (Nadeau–Bengio): `0.999079 ± 0.001127` (IC 95 % `[0.99790, 1.00000]`; `16/50` folds con `100 %` exacto). |
 
 > **Nota sobre el rendimiento de `1.00`:** El `1.00000` en `test.csv` no proviene de fuga de datos ni de memorización: mide fidelidad sobre una partición generada por DBSCAN en dos etapas (con brecha de `34,752` píxeles en `Area` para la Clase 3, separación lineal en `PCA(2)` para las Clases 0–2 y exclusión de `439` puntos de frontera), lo cual también permite que una `LogisticRegression` lineal de 68 parámetros alcance `1.00000` en `test.csv` (`39/50` folds al 100 % en RSKF) mientras la entropía sube $15\times$ sobre los puntos de frontera excluidos.

@@ -20,8 +20,9 @@ docs/
 *.fdb_latexmk
 *.synctex.gz
 
-# Artefactos generados al ejecutar el pipeline (se crean automáticamente)
-data/processed/
+# Artefactos generados al ejecutar el pipeline (se versiona solo el dataset limpio junto al crudo)
+data/processed/*
+!data/processed/dataset_limpio_clusters.csv
 models/
 results/
 
